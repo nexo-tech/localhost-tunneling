@@ -16,9 +16,10 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             pkgs.go
-            pkgs.gopls          # Go language server (for editors like VSCode)
-            pkgs.go-tools       # Various go tooling
-            pkgs.git            # Because you're a developer, allegedly
+            pkgs.gopls
+            pkgs.gofmt
+            pkgs.go-tools       
+            pkgs.git           
           ];
           shellHook = ''
               export GOPATH=$(pwd)/.gopath
