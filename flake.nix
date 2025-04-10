@@ -17,9 +17,8 @@
           buildInputs = [
             pkgs.go
             pkgs.gopls
-            pkgs.gofmt
             pkgs.go-tools       
-            pkgs.git           
+            pkgs.xcaddy
           ];
           shellHook = ''
               export GOPATH=$(pwd)/.gopath

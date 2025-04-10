@@ -28,3 +28,4 @@ go.work.sum
 tunnel-server
 tunnel-client
 .envrc
+caddy

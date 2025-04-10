@@ -1,0 +1,10 @@
+{
+    admin localhost:2019
+}
+
+*.{$DOMAIN} {
+    tls {
+        dns cloudflare {env.CF_API_TOKEN}
+    }
+    reverse_proxy localhost:3000
+}

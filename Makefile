@@ -3,3 +3,9 @@ build/server:
 
 build/client:
 	go build -o tunnel-client client/client.go
+
+build/caddy:
+	xcaddy build --with github.com/caddy-dns/cloudflare
+
+up/caddy: build/caddy
+	sudo ./caddy run --config ./Caddyfile
