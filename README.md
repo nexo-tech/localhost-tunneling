@@ -15,4 +15,7 @@ export CADDY_PROXY_PORT=3000
 
 export EMAIL=
 export PRODUCTION=true
+
+# Client variables
+export TUNNEL_SERVER_IP=
 ```

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -11,14 +12,24 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		log.Fatal("Usage: client <local-port>")
+		log.Fatal("Usage: tunnel-client <local-port>")
 	}
 	localPort := os.Args[1]
 
-	conn, err := net.Dial("tcp", "<VM-IP>:4000")
+	serverIP := os.Getenv("TUNNEL_SERVER_IP")
+	serverPort := os.Getenv("TUNNEL_SERVER_PORT")
+
+	if serverPort == "" || serverIP == "" {
+		log.Fatal("either TUNNEL_SERVER_IP or TUNNEL_SERVER_PORT is empty")
+	}
+
+	serverAddress := fmt.Sprintf("%s:%s", serverIP, serverPort)
+
+	conn, err := net.Dial("tcp", serverAddress)
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	defer conn.Close()
 
 	// Send local port to server
