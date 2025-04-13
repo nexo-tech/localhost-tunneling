@@ -122,6 +122,14 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		"subdomain":   subdomain,
 	}).Info("Assigned new port and subdomain")
 
+	// Send public domain to client
+	err = conn.WriteMessage(websocket.TextMessage, []byte(subdomain))
+	if err != nil {
+		log.WithError(err).Error("Failed to send public domain to client")
+		return
+	}
+	log.Info("Sent public domain to client")
+
 	// Configure Caddy
 	err = configureCaddy(subdomain, serverPort)
 	if err != nil {
