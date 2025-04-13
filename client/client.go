@@ -43,10 +43,8 @@ func main() {
 		}).Fatal("Missing required environment variables")
 	}
 
-	// Configure TLS for HTTP/2
-	tlsConfig := &tls.Config{
-		NextProtos: []string{"h2"},
-	}
+	// Configure TLS
+	tlsConfig := &tls.Config{}
 
 	// Connect to WebSocket endpoint
 	dialer := websocket.Dialer{

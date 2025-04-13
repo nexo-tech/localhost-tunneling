@@ -47,6 +47,13 @@ func main() {
 }
 
 func handleTunnel(w http.ResponseWriter, r *http.Request) {
+	log := log.WithFields(logrus.Fields{
+		"method": r.Method,
+		"path":   r.URL.Path,
+		"host":   r.Host,
+	})
+	log.Info("Received tunnel connection request")
+
 	// Upgrade to WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -54,6 +61,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	log.Info("Successfully upgraded to WebSocket")
 
 	// Get local port from client
 	_, message, err := conn.ReadMessage()
