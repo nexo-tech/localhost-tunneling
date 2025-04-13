@@ -4,7 +4,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
@@ -44,17 +46,48 @@ func main() {
 	}
 
 	// Configure TLS
-	tlsConfig := &tls.Config{}
-
-	// Connect to WebSocket endpoint
-	dialer := websocket.Dialer{
-		TLSClientConfig: tlsConfig,
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true, // For debugging only
 	}
 
-	wsURL := fmt.Sprintf("wss://%s:%s/tunnel", serverIP, serverPort)
-	conn, _, err := dialer.Dial(wsURL, nil)
+	// Create custom dialer with timeout
+	dialer := websocket.Dialer{
+		TLSClientConfig:  tlsConfig,
+		HandshakeTimeout: 10 * time.Second,
+	}
+
+	// Add custom headers
+	headers := http.Header{}
+	headers.Add("User-Agent", "tunnel-client/1.0")
+
+	// Construct URL without port if it's 443
+	var wsURL string
+	if serverPort == "443" {
+		wsURL = fmt.Sprintf("wss://%s/tunnel", serverIP)
+	} else {
+		wsURL = fmt.Sprintf("wss://%s:%s/tunnel", serverIP, serverPort)
+	}
+
+	log.WithFields(logrus.Fields{
+		"url":     wsURL,
+		"headers": headers,
+	}).Debug("Attempting WebSocket connection")
+
+	conn, resp, err := dialer.Dial(wsURL, headers)
 	if err != nil {
-		log.WithError(err).Fatal("Failed to connect to server")
+		log.WithFields(logrus.Fields{
+			"error": err,
+			"url":   wsURL,
+		}).Error("WebSocket connection failed")
+
+		if resp != nil {
+			log.WithFields(logrus.Fields{
+				"status":     resp.Status,
+				"statusCode": resp.StatusCode,
+				"headers":    resp.Header,
+			}).Error("Response details")
+		}
+		log.Fatal("Failed to connect to server")
 	}
 	defer conn.Close()
 	log.Info("Successfully connected to server")

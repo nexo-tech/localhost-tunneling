@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -245,5 +246,48 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.WithField("port", port).Info("Forwarding request")
-	http.Redirect(w, r, fmt.Sprintf("http://localhost:%d%s", port, r.URL.Path), http.StatusFound)
+
+	// Create a new request to the local service
+	localURL := fmt.Sprintf("http://localhost:%d%s", port, r.URL.Path)
+	req, err := http.NewRequest(r.Method, localURL, r.Body)
+	if err != nil {
+		log.WithError(err).Error("Failed to create request")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Copy headers from original request
+	for name, values := range r.Header {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
+
+	// Create HTTP client
+	client := &http.Client{}
+
+	// Forward the request
+	resp, err := client.Do(req)
+	if err != nil {
+		log.WithError(err).Error("Failed to forward request")
+		http.Error(w, "Failed to connect to local service", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers
+	for name, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+
+	// Set status code
+	w.WriteHeader(resp.StatusCode)
+
+	// Copy response body
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		log.WithError(err).Error("Failed to copy response body")
+	}
 }
