@@ -6,10 +6,11 @@
 	tls {
 		dns cloudflare {env.CF_API_TOKEN}
 	}
-	reverse_proxy localhost:4000 {
-		transport http {
-			versions h2c
-		}
+	reverse_proxy localhost:3000 {
+		header_up Host {http.request.host}
+		header_up X-Real-IP {http.request.remote}
+		header_up X-Forwarded-For {http.request.remote}
+		header_up X-Forwarded-Proto {http.request.scheme}
 	}
 }
 

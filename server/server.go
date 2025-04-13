@@ -5,13 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"sync"
 
-	"github.com/hashicorp/yamux"
+	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 )
 
@@ -21,6 +20,9 @@ var (
 	activePorts = make(map[int]bool)
 	hostMap     = make(map[string]int)
 	log         = logrus.New()
+	upgrader    = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
 )
 
 func init() {
@@ -37,52 +39,30 @@ func init() {
 func main() {
 	log.Info("Starting tunnel server")
 
-	// Start control server
-	go startControlServer(4000)
-	log.WithField("port", 4000).Info("Started control server")
-
-	// Start HTTP server for Caddy
+	// Start HTTP server with WebSocket support
+	http.HandleFunc("/tunnel", handleTunnel)
 	http.HandleFunc("/", handleHTTPRequest)
 	log.WithField("port", 3000).Info("Starting HTTP server")
 	log.Fatal(http.ListenAndServe(":3000", nil))
 }
 
-func startControlServer(port int) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+func handleTunnel(w http.ResponseWriter, r *http.Request) {
+	// Upgrade to WebSocket
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.WithError(err).Fatal("Failed to start control server")
-	}
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.WithError(err).Error("Failed to accept connection")
-			continue
-		}
-		log.WithField("remote_addr", conn.RemoteAddr().String()).Info("New client connected")
-		go handleClient(conn)
-	}
-}
-
-func handleClient(conn net.Conn) {
-	defer conn.Close()
-	log := log.WithField("remote_addr", conn.RemoteAddr().String())
-
-	// Yamux session for multiplexing
-	session, err := yamux.Server(conn, nil)
-	if err != nil {
-		log.WithError(err).Error("Failed to create yamux session")
+		log.WithError(err).Error("Failed to upgrade to WebSocket")
 		return
 	}
-	log.Info("Created yamux session")
+	defer conn.Close()
 
 	// Get local port from client
-	buf := make([]byte, 10)
-	_, err = conn.Read(buf)
+	_, message, err := conn.ReadMessage()
 	if err != nil {
-		log.WithError(err).Error("Failed to read local port from client")
+		log.WithError(err).Error("Failed to read local port")
 		return
 	}
+	localPort := string(message)
+	log.WithField("local_port", localPort).Info("Received local port from client")
 
 	// Assign port and subdomain
 	portMutex.Lock()
@@ -111,13 +91,13 @@ func handleClient(conn net.Conn) {
 	log.Info("Successfully configured Caddy")
 
 	// Start port listener
-	go startPortListener(serverPort, session)
+	go startPortListener(serverPort, conn)
 
 	// Keep connection open
 	<-context.Background().Done()
 }
 
-func startPortListener(port int, session *yamux.Session) {
+func startPortListener(port int, wsConn *websocket.Conn) {
 	log := log.WithField("port", port)
 
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -138,26 +118,37 @@ func startPortListener(port int, session *yamux.Session) {
 
 		go func(c net.Conn) {
 			defer c.Close()
-			stream, err := session.Open()
-			if err != nil {
-				log.WithError(err).Error("Failed to open stream")
-				return
-			}
-			defer stream.Close()
 
+			// Read from WebSocket and write to connection
 			go func() {
-				bytes, err := io.Copy(c, stream)
-				log.WithFields(logrus.Fields{
-					"bytes": bytes,
-					"error": err,
-				}).Info("Finished copying from stream to connection")
+				for {
+					_, message, err := wsConn.ReadMessage()
+					if err != nil {
+						log.WithError(err).Error("Failed to read from WebSocket")
+						return
+					}
+					_, err = c.Write(message)
+					if err != nil {
+						log.WithError(err).Error("Failed to write to connection")
+						return
+					}
+				}
 			}()
 
-			bytes, err := io.Copy(stream, c)
-			log.WithFields(logrus.Fields{
-				"bytes": bytes,
-				"error": err,
-			}).Info("Finished copying from connection to stream")
+			// Read from connection and write to WebSocket
+			buf := make([]byte, 1024)
+			for {
+				n, err := c.Read(buf)
+				if err != nil {
+					log.WithError(err).Error("Failed to read from connection")
+					return
+				}
+				err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
+				if err != nil {
+					log.WithError(err).Error("Failed to write to WebSocket")
+					return
+				}
+			}
 		}(conn)
 	}
 }

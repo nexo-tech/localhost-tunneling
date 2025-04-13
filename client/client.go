@@ -1,11 +1,12 @@
 package main
 
 import (
-	"io"
+	"crypto/tls"
+	"fmt"
 	"net"
 	"os"
 
-	"github.com/hashicorp/yamux"
+	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 )
 
@@ -42,10 +43,18 @@ func main() {
 		}).Fatal("Missing required environment variables")
 	}
 
-	serverAddress := net.JoinHostPort(serverIP, serverPort)
-	log.WithField("server_address", serverAddress).Info("Connecting to server")
+	// Configure TLS for HTTP/2
+	tlsConfig := &tls.Config{
+		NextProtos: []string{"h2"},
+	}
 
-	conn, err := net.Dial("tcp", serverAddress)
+	// Connect to WebSocket endpoint
+	dialer := websocket.Dialer{
+		TLSClientConfig: tlsConfig,
+	}
+
+	wsURL := fmt.Sprintf("wss://%s:%s/tunnel", serverIP, serverPort)
+	conn, _, err := dialer.Dial(wsURL, nil)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to connect to server")
 	}
@@ -53,55 +62,48 @@ func main() {
 	log.Info("Successfully connected to server")
 
 	// Send local port to server
-	_, err = conn.Write([]byte(localPort))
+	err = conn.WriteMessage(websocket.TextMessage, []byte(localPort))
 	if err != nil {
 		log.WithError(err).Fatal("Failed to send local port to server")
 	}
 	log.WithField("local_port", localPort).Info("Sent local port to server")
 
-	// Yamux client session
-	session, err := yamux.Client(conn, nil)
-	if err != nil {
-		log.WithError(err).Fatal("Failed to create yamux session")
-	}
-	log.Info("Created yamux session")
-
 	for {
-		stream, err := session.Accept()
+		// Read message from WebSocket
+		_, message, err := conn.ReadMessage()
 		if err != nil {
-			log.WithError(err).Fatal("Failed to accept stream")
+			log.WithError(err).Error("Failed to read message")
+			continue
 		}
-		log.WithField("stream_id", stream.RemoteAddr().String()).Info("Accepted new stream")
-		go handleStream(stream, localPort)
+
+		// Connect to local service
+		localConn, err := net.Dial("tcp", "localhost:"+localPort)
+		if err != nil {
+			log.WithError(err).Error("Failed to connect to local service")
+			continue
+		}
+		defer localConn.Close()
+
+		// Write received data to local service
+		_, err = localConn.Write(message)
+		if err != nil {
+			log.WithError(err).Error("Failed to write to local service")
+			continue
+		}
+
+		// Read response from local service
+		buf := make([]byte, 1024)
+		n, err := localConn.Read(buf)
+		if err != nil {
+			log.WithError(err).Error("Failed to read from local service")
+			continue
+		}
+
+		// Send response back through WebSocket
+		err = conn.WriteMessage(websocket.BinaryMessage, buf[:n])
+		if err != nil {
+			log.WithError(err).Error("Failed to send response")
+			continue
+		}
 	}
-}
-
-func handleStream(stream net.Conn, port string) {
-	defer stream.Close()
-	log := log.WithFields(logrus.Fields{
-		"stream_id":  stream.RemoteAddr().String(),
-		"local_port": port,
-	})
-
-	localConn, err := net.Dial("tcp", "localhost:"+port)
-	if err != nil {
-		log.WithError(err).Error("Failed to connect to local service")
-		return
-	}
-	defer localConn.Close()
-	log.Info("Connected to local service")
-
-	go func() {
-		bytes, err := io.Copy(stream, localConn)
-		log.WithFields(logrus.Fields{
-			"bytes": bytes,
-			"error": err,
-		}).Info("Finished copying from local to remote")
-	}()
-
-	bytes, err := io.Copy(localConn, stream)
-	log.WithFields(logrus.Fields{
-		"bytes": bytes,
-		"error": err,
-	}).Info("Finished copying from remote to local")
 }
