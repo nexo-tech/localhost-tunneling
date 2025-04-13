@@ -8,4 +8,4 @@ build/caddy:
 	xcaddy build --with github.com/caddy-dns/cloudflare
 
 up/caddy: build/caddy
-	sudo ./caddy run --config ./Caddyfile
+	sudo -E ./caddy run --config ./Caddyfile
