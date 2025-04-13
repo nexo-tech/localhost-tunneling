@@ -1,21 +1,16 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
-	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
+
+	"localhost-tunneling/server/tunnel"
+	"localhost-tunneling/server/ws"
 )
 
 var (
@@ -89,347 +84,76 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	})
 	log.Info("Received tunnel connection request")
 
-	// Upgrade to WebSocket with ping/pong support
-	upgrader := websocket.Upgrader{
-		CheckOrigin:       func(r *http.Request) bool { return true },
-		HandshakeTimeout:  10 * time.Second,
-		EnableCompression: true,
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// Create WebSocket connection
+	wsConn, err := ws.NewConnection(w, r)
 	if err != nil {
-		log.WithError(err).Error("Failed to upgrade to WebSocket")
+		log.WithError(err).Error("Failed to create WebSocket connection")
 		return
 	}
-	defer conn.Close()
-
-	// Set up ping/pong handler
-	conn.SetPingHandler(func(appData string) error {
-		log.Debug("Received ping, sending pong")
-		return conn.WriteMessage(websocket.PongMessage, []byte(appData))
-	})
-
-	// Set up pong handler
-	conn.SetPongHandler(func(appData string) error {
-		log.Debug("Received pong")
-		return nil
-	})
+	defer wsConn.Close()
 
 	// Start ping ticker
-	pingTicker := time.NewTicker(30 * time.Second)
-	defer pingTicker.Stop()
-
-	// Start connection monitoring
-	connCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Start goroutine to send pings
-	go func() {
-		for {
-			select {
-			case <-pingTicker.C:
-				if err := conn.WriteMessage(websocket.PingMessage, []byte("ping")); err != nil {
-					log.WithError(err).Error("Failed to send ping")
-					cancel()
-					return
-				}
-			case <-connCtx.Done():
-				return
-			}
-		}
-	}()
-
-	log.Info("Successfully upgraded to WebSocket")
+	wsConn.StartPingTicker()
 
 	// Get local port from client
-	_, message, err := conn.ReadMessage()
+	message, err := wsConn.ReadMessage()
 	if err != nil {
 		log.WithError(err).Error("Failed to read local port")
+		return
+	}
+	if message == nil {
+		log.Error("Expected text message for local port")
 		return
 	}
 	localPort := string(message)
 	log.WithField("local_port", localPort).Info("Received local port from client")
 
-	// Assign port and subdomain
-	portMutex.Lock()
-	serverPort := nextPort
-	for activePorts[serverPort] {
-		serverPort++
-	}
-	nextPort = serverPort + 1
-	activePorts[serverPort] = true
-	portMutex.Unlock()
+	// Create tunnel handler
+	tunnelHandler := tunnel.NewHandler(wsConn, "")
+	defer tunnelHandler.Close()
 
-	subdomain := fmt.Sprintf("%d.%s", serverPort, os.Getenv("DOMAIN"))
-	hostMap[subdomain] = serverPort
+	// Assign port and subdomain
+	port, err := tunnelHandler.AssignPort()
+	if err != nil {
+		log.WithError(err).Error("Failed to assign port")
+		return
+	}
+
+	domain := os.Getenv("DOMAIN")
+	if domain == "" {
+		log.Error("DOMAIN environment variable not set")
+		return
+	}
+
+	subdomain := fmt.Sprintf("%d.%s", port, domain)
+	wsConn.SetDomain(subdomain)
+	tunnelHandler.RegisterHost(subdomain, port)
 
 	log.WithFields(logrus.Fields{
-		"server_port": serverPort,
-		"subdomain":   subdomain,
-	}).Info("Assigned new port and subdomain")
+		"port":      port,
+		"subdomain": subdomain,
+	}).Info("Assigned port and subdomain")
 
 	// Send public domain to client
-	err = conn.WriteMessage(websocket.TextMessage, []byte(subdomain))
+	err = wsConn.WriteTextMessage(subdomain)
 	if err != nil {
 		log.WithError(err).Error("Failed to send public domain to client")
 		return
 	}
-	log.Info("Sent public domain to client")
 
-	// Configure Caddy
-	err = configureCaddy(subdomain, serverPort)
-	if err != nil {
-		log.WithError(err).Error("Failed to configure Caddy")
-		return
-	}
-	log.Info("Successfully configured Caddy")
-
-	// Start port listener
-	go startPortListener(serverPort, conn)
-
-	// Wait for context cancellation or connection close
-	<-connCtx.Done()
-	log.Info("Connection closed")
-}
-
-func startPortListener(port int, wsConn *websocket.Conn) {
-	log := log.WithField("port", port)
-
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		log.WithError(err).Error("Failed to start port listener")
-		return
-	}
-	defer ln.Close()
-	log.Info("Started port listener")
-
-	// Create a context for managing the listener
-	listenerCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Start a goroutine to handle incoming connections
-	go func() {
-		for {
-			select {
-			case <-listenerCtx.Done():
-				return
-			default:
-				conn, err := ln.Accept()
-				if err != nil {
-					if !errors.Is(err, net.ErrClosed) {
-						log.WithError(err).Error("Failed to accept connection")
-					}
-					continue
-				}
-
-				log.WithField("remote_addr", conn.RemoteAddr().String()).Info("New connection accepted")
-
-				// Create a context for this connection
-				connCtx, connCancel := context.WithCancel(listenerCtx)
-
-				// Start goroutines to handle the connection
-				go func(c net.Conn) {
-					defer func() {
-						c.Close()
-						connCancel()
-					}()
-
-					// Create a message buffer for WebSocket messages
-					messageBuffer := make([]byte, 0, 4096)
-
-					// Read from WebSocket and write to connection
-					go func() {
-						for {
-							select {
-							case <-connCtx.Done():
-								return
-							default:
-								messageType, message, err := wsConn.ReadMessage()
-								if err != nil {
-									if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-										log.WithError(err).Error("Failed to read from WebSocket")
-									}
-									return
-								}
-
-								// Only process binary messages
-								if messageType != websocket.BinaryMessage {
-									continue
-								}
-
-								// Write the complete message to the connection
-								_, err = c.Write(message)
-								if err != nil {
-									if !errors.Is(err, net.ErrClosed) {
-										log.WithError(err).Error("Failed to write to connection")
-									}
-									return
-								}
-							}
-						}
-					}()
-
-					// Read from connection and write to WebSocket
-					buf := make([]byte, 4096)
-					for {
-						select {
-						case <-connCtx.Done():
-							return
-						default:
-							n, err := c.Read(buf)
-							if err != nil {
-								if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-									log.WithError(err).Error("Failed to read from connection")
-								}
-								return
-							}
-
-							// Append to message buffer
-							messageBuffer = append(messageBuffer, buf[:n]...)
-
-							// If we have a complete message, send it
-							if len(messageBuffer) > 0 {
-								err = wsConn.WriteMessage(websocket.BinaryMessage, messageBuffer)
-								if err != nil {
-									if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-										log.WithError(err).Error("Failed to write to WebSocket")
-									}
-									return
-								}
-								// Clear the buffer
-								messageBuffer = messageBuffer[:0]
-							}
-						}
-					}
-				}(conn)
-			}
-		}
-	}()
-
-	// Wait for WebSocket connection to close
-	<-listenerCtx.Done()
-	log.Info("Port listener shutting down")
-}
-
-func configureCaddy(subdomain string, port int) error {
-	log := log.WithFields(logrus.Fields{
-		"subdomain": subdomain,
-		"port":      port,
-	})
-
-	config := map[string]interface{}{
-		"@id": subdomain,
-		"match": []map[string]interface{}{{
-			"host": []string{subdomain},
-		}},
-		"handle": []map[string]interface{}{{
-			"handler": "reverse_proxy",
-			"upstreams": []map[string]interface{}{{
-				"dial": fmt.Sprintf("localhost:%d", port),
-			}},
-		}},
-	}
-
-	jsonData, _ := json.Marshal(config)
-	req, _ := http.NewRequest(
-		"POST",
-		"http://localhost:2019/config/apps/http/servers/srv0/routes",
-		bytes.NewBuffer(jsonData),
-	)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.WithError(err).Error("Failed to send Caddy configuration")
-		return err
-	}
-	defer resp.Body.Close()
-
-	log.Info("Successfully configured Caddy")
-	return nil
+	// Start handling tunnel traffic
+	tunnelHandler.Start()
 }
 
 func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	log := log.WithFields(logrus.Fields{
-		"host": r.Host,
-		"path": r.URL.Path,
+		"method": r.Method,
+		"path":   r.URL.Path,
+		"host":   r.Host,
 	})
+	log.Info("Received HTTP request")
 
-	host := r.Host
-	port, exists := hostMap[host]
-	if !exists {
-		log.Error("Tunnel not found")
-		http.Error(w, "Tunnel not found", http.StatusNotFound)
-		return
-	}
-
-	log.WithField("port", port).Info("Forwarding request")
-
-	// Create a new request to the local service
-	localURL := fmt.Sprintf("http://localhost:%d%s", port, r.URL.Path)
-	req, err := http.NewRequest(r.Method, localURL, r.Body)
-	if err != nil {
-		log.WithError(err).Error("Failed to create request")
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Copy headers from original request
-	for name, values := range r.Header {
-		for _, value := range values {
-			req.Header.Add(name, value)
-		}
-	}
-
-	// Create HTTP client with proper timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	// Forward the request
-	resp, err := client.Do(req)
-	if err != nil {
-		log.WithError(err).Error("Failed to forward request")
-		http.Error(w, "Failed to connect to local service", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Copy response headers
-	for name, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(name, value)
-		}
-	}
-
-	// Set status code
-	w.WriteHeader(resp.StatusCode)
-
-	// Copy response body with proper error handling
-	_, err = io.Copy(w, resp.Body)
-	if err != nil {
-		// Check if the error is due to chunked encoding
-		if strings.Contains(err.Error(), "chunk length") {
-			// Try to read the body in chunks
-			buf := make([]byte, 4096)
-			for {
-				n, err := resp.Body.Read(buf)
-				if n > 0 {
-					if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-						log.WithError(writeErr).Error("Failed to write response chunk")
-						return
-					}
-				}
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					log.WithError(err).Error("Failed to read response chunk")
-					return
-				}
-			}
-		} else {
-			log.WithError(err).Error("Failed to copy response body")
-		}
-	}
+	// Create a temporary tunnel handler to handle the request
+	tunnelHandler := tunnel.NewHandler(nil, "")
+	tunnelHandler.HandleHTTPRequest(w, r)
 }
