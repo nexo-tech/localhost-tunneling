@@ -58,8 +58,23 @@ func main() {
 	// Start HTTP server with WebSocket support
 	http.HandleFunc("/tunnel", handleTunnel)
 	http.HandleFunc("/", handleHTTPRequest)
-	log.WithField("port", proxyPort).Info("Starting HTTP server")
-	log.Fatal(http.ListenAndServe(":"+proxyPort, nil))
+
+	addr := ":" + proxyPort
+	log.WithField("address", addr).Info("Listening for connections")
+
+	server := &http.Server{
+		Addr: addr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			log.WithFields(logrus.Fields{
+				"method": r.Method,
+				"path":   r.URL.Path,
+				"host":   r.Host,
+			}).Info("Incoming request")
+			http.DefaultServeMux.ServeHTTP(w, r)
+		}),
+	}
+
+	log.Fatal(server.ListenAndServe())
 }
 
 func handleTunnel(w http.ResponseWriter, r *http.Request) {
