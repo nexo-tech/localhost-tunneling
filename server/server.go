@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -201,49 +202,96 @@ func startPortListener(port int, wsConn *websocket.Conn) {
 	defer ln.Close()
 	log.Info("Started port listener")
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.WithError(err).Error("Failed to accept connection")
-			continue
-		}
-		log.WithField("remote_addr", conn.RemoteAddr().String()).Info("New connection accepted")
+	// Create a context for managing the listener
+	listenerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-		go func(c net.Conn) {
-			defer c.Close()
-
-			// Read from WebSocket and write to connection
-			go func() {
-				for {
-					_, message, err := wsConn.ReadMessage()
-					if err != nil {
-						log.WithError(err).Error("Failed to read from WebSocket")
-						return
-					}
-					_, err = c.Write(message)
-					if err != nil {
-						log.WithError(err).Error("Failed to write to connection")
-						return
-					}
-				}
-			}()
-
-			// Read from connection and write to WebSocket
-			buf := make([]byte, 1024)
-			for {
-				n, err := c.Read(buf)
+	// Start a goroutine to handle incoming connections
+	go func() {
+		for {
+			select {
+			case <-listenerCtx.Done():
+				return
+			default:
+				conn, err := ln.Accept()
 				if err != nil {
-					log.WithError(err).Error("Failed to read from connection")
-					return
+					if !errors.Is(err, net.ErrClosed) {
+						log.WithError(err).Error("Failed to accept connection")
+					}
+					continue
 				}
-				err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
-				if err != nil {
-					log.WithError(err).Error("Failed to write to WebSocket")
-					return
-				}
+
+				log.WithField("remote_addr", conn.RemoteAddr().String()).Info("New connection accepted")
+
+				// Create a context for this connection
+				connCtx, connCancel := context.WithCancel(listenerCtx)
+
+				// Start goroutines to handle the connection
+				go func(c net.Conn) {
+					defer func() {
+						c.Close()
+						connCancel()
+					}()
+
+					// Read from WebSocket and write to connection
+					go func() {
+						for {
+							select {
+							case <-connCtx.Done():
+								return
+							default:
+								messageType, message, err := wsConn.ReadMessage()
+								if err != nil {
+									if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+										log.WithError(err).Error("Failed to read from WebSocket")
+									}
+									return
+								}
+								if messageType != websocket.BinaryMessage {
+									continue
+								}
+								_, err = c.Write(message)
+								if err != nil {
+									if !errors.Is(err, net.ErrClosed) {
+										log.WithError(err).Error("Failed to write to connection")
+									}
+									return
+								}
+							}
+						}
+					}()
+
+					// Read from connection and write to WebSocket
+					buf := make([]byte, 1024)
+					for {
+						select {
+						case <-connCtx.Done():
+							return
+						default:
+							n, err := c.Read(buf)
+							if err != nil {
+								if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+									log.WithError(err).Error("Failed to read from connection")
+								}
+								return
+							}
+							err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
+							if err != nil {
+								if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+									log.WithError(err).Error("Failed to write to WebSocket")
+								}
+								return
+							}
+						}
+					}
+				}(conn)
 			}
-		}(conn)
-	}
+		}
+	}()
+
+	// Wait for WebSocket connection to close
+	<-listenerCtx.Done()
+	log.Info("Port listener shutting down")
 }
 
 func configureCaddy(subdomain string, port int) error {
