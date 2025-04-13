@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -25,26 +26,7 @@ func init() {
 	log.SetLevel(logrus.DebugLevel)
 }
 
-func main() {
-	if len(os.Args) < 2 {
-		log.Fatal("Usage: tunnel-client <local-port>")
-	}
-	localPort := os.Args[1]
-	log.WithField("local_port", localPort).Info("Starting tunnel client")
-
-	serverIP := os.Getenv("TUNNEL_SERVER_IP")
-	serverPort := os.Getenv("TUNNEL_SERVER_PORT")
-	if serverPort == "" {
-		serverPort = "443"
-	}
-
-	if serverPort == "" || serverIP == "" {
-		log.WithFields(logrus.Fields{
-			"server_ip":   serverIP,
-			"server_port": serverPort,
-		}).Fatal("Missing required environment variables")
-	}
-
+func connectToServer(serverIP, serverPort, localPort string) (*websocket.Conn, string, error) {
 	// Configure TLS
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true, // For debugging only
@@ -52,8 +34,9 @@ func main() {
 
 	// Create custom dialer with timeout
 	dialer := websocket.Dialer{
-		TLSClientConfig:  tlsConfig,
-		HandshakeTimeout: 10 * time.Second,
+		TLSClientConfig:   tlsConfig,
+		HandshakeTimeout:  10 * time.Second,
+		EnableCompression: true,
 	}
 
 	// Add custom headers
@@ -75,11 +58,6 @@ func main() {
 
 	conn, resp, err := dialer.Dial(wsURL, headers)
 	if err != nil {
-		log.WithFields(logrus.Fields{
-			"error": err,
-			"url":   wsURL,
-		}).Error("WebSocket connection failed")
-
 		if resp != nil {
 			log.WithFields(logrus.Fields{
 				"status":     resp.Status,
@@ -87,32 +65,115 @@ func main() {
 				"headers":    resp.Header,
 			}).Error("Response details")
 		}
-		log.Fatal("Failed to connect to server")
+		return nil, "", err
 	}
-	defer conn.Close()
-	log.Info("Successfully connected to server")
+
+	// Set up ping/pong handler
+	conn.SetPingHandler(func(appData string) error {
+		log.Debug("Received ping, sending pong")
+		return conn.WriteMessage(websocket.PongMessage, []byte(appData))
+	})
+
+	// Set up pong handler
+	conn.SetPongHandler(func(appData string) error {
+		log.Debug("Received pong")
+		return nil
+	})
 
 	// Send local port to server
 	err = conn.WriteMessage(websocket.TextMessage, []byte(localPort))
 	if err != nil {
-		log.WithError(err).Fatal("Failed to send local port to server")
+		conn.Close()
+		return nil, "", err
 	}
 	log.WithField("local_port", localPort).Info("Sent local port to server")
 
 	// Wait for public domain assignment
 	messageType, message, err := conn.ReadMessage()
 	if err != nil {
-		log.WithError(err).Fatal("Failed to receive public domain")
+		conn.Close()
+		return nil, "", err
 	}
 	if messageType != websocket.TextMessage {
-		log.WithField("message_type", messageType).Fatal("Expected text message for domain assignment")
+		conn.Close()
+		return nil, "", fmt.Errorf("expected text message for domain assignment, got %d", messageType)
 	}
 	publicDomain := string(message)
 	log.WithField("public_domain", publicDomain).Info("Received public domain assignment")
 
+	return conn, publicDomain, nil
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		log.Fatal("Usage: tunnel-client <local-port>")
+	}
+	localPort := os.Args[1]
+	log.WithField("local_port", localPort).Info("Starting tunnel client")
+
+	serverIP := os.Getenv("TUNNEL_SERVER_IP")
+	serverPort := os.Getenv("TUNNEL_SERVER_PORT")
+	if serverPort == "" {
+		serverPort = "443"
+	}
+
+	if serverPort == "" || serverIP == "" {
+		log.WithFields(logrus.Fields{
+			"server_ip":   serverIP,
+			"server_port": serverPort,
+		}).Fatal("Missing required environment variables")
+	}
+
+	var conn *websocket.Conn
+	// var publicDomain string
+	var err error
+
+	// Retry connection with exponential backoff
+	for i := 0; i < 5; i++ {
+		conn, _, err = connectToServer(serverIP, serverPort, localPort)
+		if err == nil {
+			break
+		}
+		waitTime := time.Duration(1<<uint(i)) * time.Second
+		log.WithFields(logrus.Fields{
+			"attempt": i + 1,
+			"wait":    waitTime,
+			"error":   err,
+		}).Error("Failed to connect, retrying...")
+		time.Sleep(waitTime)
+	}
+	if err != nil {
+		log.WithError(err).Fatal("Failed to connect after retries")
+	}
+	defer conn.Close()
+
 	// Set up a channel to handle incoming messages
 	messageChan := make(chan []byte)
 	errorChan := make(chan error)
+
+	// Start ping ticker
+	pingTicker := time.NewTicker(30 * time.Second)
+	defer pingTicker.Stop()
+
+	// Start connection monitoring
+	connCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start goroutine to send pings
+	go func() {
+		for {
+			select {
+			case <-pingTicker.C:
+				if err := conn.WriteMessage(websocket.PingMessage, []byte("ping")); err != nil {
+					log.WithError(err).Error("Failed to send ping")
+					cancel()
+					return
+				}
+			case <-connCtx.Done():
+				return
+			}
+		}
+	}()
 
 	// Start a goroutine to read messages
 	go func() {
@@ -178,6 +239,40 @@ func main() {
 
 		case err := <-errorChan:
 			log.WithError(err).Error("WebSocket read error")
+			// Attempt to reconnect
+			for i := range 5 {
+				conn, _, err = connectToServer(serverIP, serverPort, localPort)
+				if err == nil {
+					log.Info("Successfully reconnected to server")
+					// Restart the message reading goroutine
+					go func() {
+						for {
+							messageType, message, err := conn.ReadMessage()
+							if err != nil {
+								errorChan <- err
+								return
+							}
+							if messageType == websocket.BinaryMessage {
+								messageChan <- message
+							}
+						}
+					}()
+					break
+				}
+				waitTime := time.Duration(1<<uint(i)) * time.Second
+				log.WithFields(logrus.Fields{
+					"attempt": i + 1,
+					"wait":    waitTime,
+					"error":   err,
+				}).Error("Failed to reconnect, retrying...")
+				time.Sleep(waitTime)
+			}
+			if err != nil {
+				log.WithError(err).Fatal("Failed to reconnect after retries")
+			}
+
+		case <-connCtx.Done():
+			log.Info("Connection closed")
 			return
 		}
 	}

@@ -11,7 +11,7 @@ const server = http.createServer(function(_, res) {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Tunneling Test: update?</title>
+      <title>Tunneling Test: update!</title>
     </head>
     <body>
       <h1>Tunneling Test</h1>

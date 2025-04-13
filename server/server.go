@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
@@ -86,13 +87,56 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	})
 	log.Info("Received tunnel connection request")
 
-	// Upgrade to WebSocket
+	// Upgrade to WebSocket with ping/pong support
+	upgrader := websocket.Upgrader{
+		CheckOrigin:       func(r *http.Request) bool { return true },
+		HandshakeTimeout:  10 * time.Second,
+		EnableCompression: true,
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.WithError(err).Error("Failed to upgrade to WebSocket")
 		return
 	}
 	defer conn.Close()
+
+	// Set up ping/pong handler
+	conn.SetPingHandler(func(appData string) error {
+		log.Debug("Received ping, sending pong")
+		return conn.WriteMessage(websocket.PongMessage, []byte(appData))
+	})
+
+	// Set up pong handler
+	conn.SetPongHandler(func(appData string) error {
+		log.Debug("Received pong")
+		return nil
+	})
+
+	// Start ping ticker
+	pingTicker := time.NewTicker(30 * time.Second)
+	defer pingTicker.Stop()
+
+	// Start connection monitoring
+	connCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start goroutine to send pings
+	go func() {
+		for {
+			select {
+			case <-pingTicker.C:
+				if err := conn.WriteMessage(websocket.PingMessage, []byte("ping")); err != nil {
+					log.WithError(err).Error("Failed to send ping")
+					cancel()
+					return
+				}
+			case <-connCtx.Done():
+				return
+			}
+		}
+	}()
+
 	log.Info("Successfully upgraded to WebSocket")
 
 	// Get local port from client
@@ -141,8 +185,9 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	// Start port listener
 	go startPortListener(serverPort, conn)
 
-	// Keep connection open
-	<-context.Background().Done()
+	// Wait for context cancellation or connection close
+	<-connCtx.Done()
+	log.Info("Connection closed")
 }
 
 func startPortListener(port int, wsConn *websocket.Conn) {
