@@ -125,7 +125,6 @@ func main() {
 	}
 
 	var conn *websocket.Conn
-	// var publicDomain string
 	var err error
 
 	// Retry connection with exponential backoff
@@ -175,15 +174,26 @@ func main() {
 		}
 	}()
 
+	// Create a message buffer for WebSocket messages
+
 	// Start a goroutine to read messages
 	go func() {
 		for {
-			messageType, message, err := conn.ReadMessage()
-			if err != nil {
-				errorChan <- err
+			select {
+			case <-connCtx.Done():
 				return
-			}
-			if messageType == websocket.BinaryMessage {
+			default:
+				messageType, message, err := conn.ReadMessage()
+				if err != nil {
+					errorChan <- err
+					return
+				}
+
+				// Only process binary messages
+				if messageType != websocket.BinaryMessage {
+					continue
+				}
+
 				messageChan <- message
 			}
 		}
@@ -217,7 +227,7 @@ func main() {
 			log.Debug("Forwarded request to local service")
 
 			// Read response from local service
-			buf := make([]byte, 1024)
+			buf := make([]byte, 4096)
 			n, err := localConn.Read(buf)
 			if err != nil {
 				log.WithError(err).Error("Failed to read from local service")
@@ -247,12 +257,21 @@ func main() {
 					// Restart the message reading goroutine
 					go func() {
 						for {
-							messageType, message, err := conn.ReadMessage()
-							if err != nil {
-								errorChan <- err
+							select {
+							case <-connCtx.Done():
 								return
-							}
-							if messageType == websocket.BinaryMessage {
+							default:
+								messageType, message, err := conn.ReadMessage()
+								if err != nil {
+									errorChan <- err
+									return
+								}
+
+								// Only process binary messages
+								if messageType != websocket.BinaryMessage {
+									continue
+								}
+
 								messageChan <- message
 							}
 						}

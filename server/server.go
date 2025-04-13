@@ -233,6 +233,9 @@ func startPortListener(port int, wsConn *websocket.Conn) {
 						connCancel()
 					}()
 
+					// Create a message buffer for WebSocket messages
+					messageBuffer := make([]byte, 0, 4096)
+
 					// Read from WebSocket and write to connection
 					go func() {
 						for {
@@ -247,9 +250,13 @@ func startPortListener(port int, wsConn *websocket.Conn) {
 									}
 									return
 								}
+
+								// Only process binary messages
 								if messageType != websocket.BinaryMessage {
 									continue
 								}
+
+								// Write the complete message to the connection
 								_, err = c.Write(message)
 								if err != nil {
 									if !errors.Is(err, net.ErrClosed) {
@@ -262,7 +269,7 @@ func startPortListener(port int, wsConn *websocket.Conn) {
 					}()
 
 					// Read from connection and write to WebSocket
-					buf := make([]byte, 1024)
+					buf := make([]byte, 4096)
 					for {
 						select {
 						case <-connCtx.Done():
@@ -275,12 +282,21 @@ func startPortListener(port int, wsConn *websocket.Conn) {
 								}
 								return
 							}
-							err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
-							if err != nil {
-								if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-									log.WithError(err).Error("Failed to write to WebSocket")
+
+							// Append to message buffer
+							messageBuffer = append(messageBuffer, buf[:n]...)
+
+							// If we have a complete message, send it
+							if len(messageBuffer) > 0 {
+								err = wsConn.WriteMessage(websocket.BinaryMessage, messageBuffer)
+								if err != nil {
+									if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+										log.WithError(err).Error("Failed to write to WebSocket")
+									}
+									return
 								}
-								return
+								// Clear the buffer
+								messageBuffer = messageBuffer[:0]
 							}
 						}
 					}
