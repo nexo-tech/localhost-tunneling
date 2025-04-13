@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -380,8 +381,10 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Create HTTP client
-	client := &http.Client{}
+	// Create HTTP client with proper timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 
 	// Forward the request
 	resp, err := client.Do(req)
@@ -402,9 +405,31 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	// Set status code
 	w.WriteHeader(resp.StatusCode)
 
-	// Copy response body
+	// Copy response body with proper error handling
 	_, err = io.Copy(w, resp.Body)
 	if err != nil {
-		log.WithError(err).Error("Failed to copy response body")
+		// Check if the error is due to chunked encoding
+		if strings.Contains(err.Error(), "chunk length") {
+			// Try to read the body in chunks
+			buf := make([]byte, 4096)
+			for {
+				n, err := resp.Body.Read(buf)
+				if n > 0 {
+					if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+						log.WithError(writeErr).Error("Failed to write response chunk")
+						return
+					}
+				}
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					log.WithError(err).Error("Failed to read response chunk")
+					return
+				}
+			}
+		} else {
+			log.WithError(err).Error("Failed to copy response body")
+		}
 	}
 }
