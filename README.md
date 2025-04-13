@@ -4,53 +4,56 @@ A simple tunneling solution to expose local services to the internet.
 
 ## Configuration
 
-The client can be configured using environment variables:
+### Server Configuration
+```bash
+# Required: Domain configuration
+export DOMAIN=yourdomain.com
+export TUNNEL_SERVER_DOMAIN_NAME=tunnel.yourdomain.com  # Subdomain for tunnel server
+export CADDY_ADMIN_API=localhost:2019
+export CADDY_PROXY_PORT=3000
 
+# Cloudflare configuration
+export CF_API_TOKEN=your_cloudflare_token
+export EMAIL=your_email@example.com
+export PRODUCTION=true
+```
+
+### Client Configuration
 ```bash
 # Required: Server address (supports both IP and hostname)
-TUNNEL_SERVER_IP=your.server.com  # or IP address like 192.168.1.100 or [2001:db8::1]
-TUNNEL_SERVER_PORT=4000          # Optional, defaults to 4000 if not specified
+export TUNNEL_SERVER_IP=tunnel.yourdomain.com  # Must match TUNNEL_SERVER_DOMAIN_NAME
+export TUNNEL_SERVER_PORT=443                  # Default port for HTTPS/WSS
 ```
 
 ### Examples:
 
 ```bash
-# Using hostname
-TUNNEL_SERVER_IP=my-tunnel-server.com
-TUNNEL_SERVER_PORT=4000
+# Server configuration
+export DOMAIN=example.com
+export TUNNEL_SERVER_DOMAIN_NAME=tunnel.example.com
+export CF_API_TOKEN=your_token
+export EMAIL=admin@example.com
 
-# Using IPv4
-TUNNEL_SERVER_IP=192.168.1.100
-TUNNEL_SERVER_PORT=4000
-
-# Using IPv6
-TUNNEL_SERVER_IP=[2001:db8::1]
-TUNNEL_SERVER_PORT=4000
-
-# Using hostname without port (will use default port 4000)
-TUNNEL_SERVER_IP=my-tunnel-server.com
+# Client configuration
+export TUNNEL_SERVER_IP=tunnel.example.com
+export TUNNEL_SERVER_PORT=443
 ```
 
 ## Usage
 
-# localhost-tunneling
-
-A basic client/server up to implement localhost tunneling
-
-
-## .envrc example
-
+1. Start the server:
 ```bash
-export CF_API_TOKEN=
-
-export DOMAIN=
-export CADDY_ADMIN_API=localhost:2019
-export TUNNEL_SERVER_PORT=4000
-export CADDY_PROXY_PORT=3000
-
-export EMAIL=
-export PRODUCTION=true
-
-# Client variables
-export TUNNEL_SERVER_IP=
+go run server/server.go
 ```
+
+2. Start the client:
+```bash
+go run client/client.go <local-port>
+```
+
+## Features
+
+- Secure WebSocket-based tunneling
+- Automatic TLS with Let's Encrypt
+- Cloudflare integration for DNS and CDN
+- Structured logging for easy debugging

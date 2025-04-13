@@ -37,13 +37,29 @@ func init() {
 }
 
 func main() {
-	log.Info("Starting tunnel server")
+	// Read configuration from environment
+	domain := os.Getenv("DOMAIN")
+	tunnelDomain := os.Getenv("TUNNEL_SERVER_DOMAIN_NAME")
+	proxyPort := os.Getenv("CADDY_PROXY_PORT")
+	if proxyPort == "" {
+		proxyPort = "3000"
+	}
+
+	if domain == "" || tunnelDomain == "" {
+		log.Fatal("Missing required environment variables: DOMAIN and TUNNEL_SERVER_DOMAIN_NAME")
+	}
+
+	log.WithFields(logrus.Fields{
+		"domain":        domain,
+		"tunnel_domain": tunnelDomain,
+		"proxy_port":    proxyPort,
+	}).Info("Starting tunnel server")
 
 	// Start HTTP server with WebSocket support
 	http.HandleFunc("/tunnel", handleTunnel)
 	http.HandleFunc("/", handleHTTPRequest)
-	log.WithField("port", 3000).Info("Starting HTTP server")
-	log.Fatal(http.ListenAndServe(":3000", nil))
+	log.WithField("port", proxyPort).Info("Starting HTTP server")
+	log.Fatal(http.ListenAndServe(":"+proxyPort, nil))
 }
 
 func handleTunnel(w http.ResponseWriter, r *http.Request) {
@@ -82,7 +98,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	activePorts[serverPort] = true
 	portMutex.Unlock()
 
-	subdomain := fmt.Sprintf("%d.tunnel.yourdomain.com", serverPort)
+	subdomain := fmt.Sprintf("%d.%s", serverPort, os.Getenv("DOMAIN"))
 	hostMap[subdomain] = serverPort
 
 	log.WithFields(logrus.Fields{
