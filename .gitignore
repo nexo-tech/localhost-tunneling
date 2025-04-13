@@ -25,5 +25,7 @@ go.work.sum
 .env
 
 .gopath
-client
-server
+tunnel-server
+tunnel-client
+.envrc
+caddy
