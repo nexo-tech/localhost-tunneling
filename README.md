@@ -14,8 +14,6 @@ export CADDY_PROXY_PORT=3000
 
 # Cloudflare configuration
 export CF_API_TOKEN=your_cloudflare_token
-export EMAIL=your_email@example.com
-export PRODUCTION=true
 ```
 
 ### Client Configuration
