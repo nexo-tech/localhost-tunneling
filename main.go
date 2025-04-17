@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -15,10 +14,14 @@ import (
 
 	"github.com/gorilla/websocket"
 	yamux "github.com/hashicorp/yamux"
+	"github.com/sirupsen/logrus"
 )
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
+	// Structured JSON logging & debug level
+	logrus.SetFormatter(&logrus.JSONFormatter{})
+	logrus.SetLevel(logrus.DebugLevel)
 }
 
 func randString(n int) string {
@@ -30,7 +33,7 @@ func randString(n int) string {
 	return string(b)
 }
 
-// WebSocket↔net.Conn adapter
+// wsConn adapts a websocket.Conn to net.Conn for yamux
 type wsConn struct {
 	ws      *websocket.Conn
 	readBuf bytes.Buffer
@@ -47,7 +50,7 @@ func (c *wsConn) Read(p []byte) (int, error) {
 			return 0, err
 		}
 		if t != websocket.BinaryMessage {
-			return 0, fmt.Errorf("expected binary, got %v", t)
+			return 0, fmt.Errorf("expected binary message, got %v", t)
 		}
 		_, err = io.Copy(&c.readBuf, r)
 		if err != nil {
@@ -86,140 +89,165 @@ func (d dummyAddr) String() string  { return string(d) }
 
 func main() {
 	port := flag.Int("port", 8080, "server listen port or client local port")
-	base := flag.String("base-domain-name", "", "tunnel.example.com (server only)")
-	srvURL := flag.String("server-url", "", "wss://example.com/tunnel (client only)")
+	base := flag.String("base-domain-name", "", "tunnel.example.com (server)")
+	srvURL := flag.String("server-url", "", "wss://example.com/tunnel (client)")
 	flag.Parse()
 
 	if *srvURL == "" {
-		if *base == "" {
-			log.Fatal("↳ server mode needs --base-domain-name")
-		}
+		logrus.WithFields(logrus.Fields{"port": *port, "base_domain": *base}).Info("Starting server mode")
 		runServer(*port, *base)
 	} else {
-		// client: positional arg for local port
-		args := flag.Args()
-		if len(args) > 0 {
-			if p, err := fmt.Sscanf(args[0], "%d", port); err != nil || p != 1 {
-				log.Fatal("↳ client needs <port> before flags")
-			}
-		}
+		logrus.WithFields(logrus.Fields{"port": *port, "server_url": *srvURL}).Info("Starting client mode")
 		runClient(*port, *srvURL)
 	}
 }
 
 func runServer(listenPort int, baseDomain string) {
-	var (
-		upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-		sessions = make(map[string]*yamux.Session)
-		mu       sync.RWMutex
-	)
-	// websocket endpoint for clients
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	sessions := make(map[string]*yamux.Session)
+	var mu sync.RWMutex
+
+	// WebSocket endpoint for client tunnels
 	http.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
 		ws, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Println("upgrade:", err)
+			logrus.WithError(err).Error("WebSocket upgrade failed")
 			return
 		}
 		id := randString(8)
-		ws.WriteJSON(map[string]string{"id": id, "base_domain": baseDomain})
+		handshake := map[string]string{"id": id, "base_domain": baseDomain}
+		ws.WriteJSON(handshake)
 		conn := newWSConn(ws)
 		sess, err := yamux.Server(conn, nil)
 		if err != nil {
-			log.Println("yamux:", err)
+			logrus.WithError(err).Error("Failed to create yamux server session")
 			ws.Close()
 			return
 		}
 		mu.Lock()
 		sessions[id] = sess
 		mu.Unlock()
-		log.Printf("→ client registered: %s.%s\n", id, baseDomain)
-		// cleanup on close
+		logrus.WithFields(logrus.Fields{"id": id, "base_domain": baseDomain}).Info("Client registered")
+
+		// Cleanup
 		go func() {
 			<-sess.CloseChan()
 			mu.Lock()
 			delete(sessions, id)
 			mu.Unlock()
-			log.Printf("← client disconnected: %s\n", id)
+			logrus.WithField("id", id).Info("Client disconnected")
 		}()
 	})
 
-	// proxy HTTP based on subdomain
+	// Proxy HTTP based on subdomain
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		id := strings.TrimSuffix(host, "."+baseDomain)
+		logrus.WithFields(logrus.Fields{"host": host, "tunnel_id": id, "remote_addr": r.RemoteAddr}).Info("Incoming HTTP request")
+
 		mu.RLock()
 		sess := sessions[id]
 		mu.RUnlock()
 		if sess == nil {
-			http.Error(w, "no such tunnel", 404)
+			logrus.WithField("id", id).Warn("No such tunnel")
+			http.Error(w, "no such tunnel", http.StatusNotFound)
 			return
 		}
+
 		stream, err := sess.Open()
 		if err != nil {
-			http.Error(w, "tunnel error", 502)
+			logrus.WithError(err).Error("Failed to open yamux stream")
+			http.Error(w, "tunnel error", http.StatusBadGateway)
 			return
 		}
+		logrus.Debugf("Opened yamux stream for tunnel %s", id)
+
 		hj, ok := w.(http.Hijacker)
 		if !ok {
-			http.Error(w, "cannot hijack", 500)
+			logrus.Error("ResponseWriter does not support hijack")
+			http.Error(w, "cannot hijack", http.StatusInternalServerError)
 			return
 		}
 		netConn, _, err := hj.Hijack()
 		if err != nil {
 			stream.Close()
+			logrus.WithError(err).Error("HTTP hijack failed")
 			return
 		}
-		// send the raw HTTP request over the stream
+
+		// Send raw HTTP over the stream
 		if err := r.Write(stream); err != nil {
 			netConn.Close()
 			stream.Close()
+			logrus.WithError(err).Error("Failed to forward request to stream")
 			return
 		}
-		// bidirectional copy
-		go io.Copy(netConn, stream)
-		go io.Copy(stream, netConn)
+
+		// Bidirectional copy
+		go func() {
+			io.Copy(netConn, stream)
+			netConn.Close()
+			stream.Close()
+		}()
+		go func() {
+			io.Copy(stream, netConn)
+			stream.Close()
+			netConn.Close()
+		}()
 	})
 
-	log.Printf("Server listening on :%d\n", listenPort)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", listenPort), nil))
+	addr := fmt.Sprintf(":%d", listenPort)
+	logrus.WithField("listen_addr", addr).Info("Server listening")
+	logrus.Fatal(http.ListenAndServe(addr, nil))
 }
 
 func runClient(localPort int, serverURL string) {
 	ws, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
 	if err != nil {
-		log.Fatal("dial:", err)
+		logrus.WithError(err).Fatal("Failed to dial server")
 	}
+	logrus.WithField("server_url", serverURL).Info("WebSocket connection established")
+
 	var info struct {
 		ID         string `json:"id"`
 		BaseDomain string `json:"base_domain"`
 	}
 	if err := ws.ReadJSON(&info); err != nil {
-		log.Fatal("handshake:", err)
+		logrus.WithError(err).Fatal("Handshake failed")
 	}
-	fmt.Printf("▶ your tunnel is: %s.%s\n", info.ID, info.BaseDomain)
+	logrus.WithFields(logrus.Fields{"id": info.ID, "base_domain": info.BaseDomain}).Info("Handshake info received")
+	fmt.Printf("▶ Tunnel ready at %s.%s\n", info.ID, info.BaseDomain)
 
 	conn := newWSConn(ws)
 	sess, err := yamux.Client(conn, nil)
 	if err != nil {
-		log.Fatal("yamux:", err)
+		logrus.WithError(err).Fatal("Failed to create yamux client session")
 	}
+	logrus.Info("Yamux session established")
+
 	for {
 		stream, err := sess.Accept()
 		if err != nil {
-			log.Println("session closed")
+			logrus.WithError(err).Info("Yamux session closed")
 			return
 		}
+		logrus.Debug("New yamux stream accepted")
 		go handleStream(stream, localPort)
 	}
 }
 
 func handleStream(stream net.Conn, localPort int) {
 	defer stream.Close()
+	logrus.WithField("local_port", localPort).Debug("Handling new stream")
+
 	local, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
 	if err != nil {
+		logrus.WithError(err).Error("Failed to connect to local service")
 		return
 	}
 	defer local.Close()
+
+	// Copy data
 	go io.Copy(local, stream)
 	io.Copy(stream, local)
 }
