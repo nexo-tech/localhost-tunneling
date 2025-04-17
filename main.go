@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -10,7 +9,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -71,10 +69,13 @@ func (c *wsConn) Write(p []byte) (int, error) {
 	return n, w.Close()
 }
 
-func (c *wsConn) Close() error                    { return c.ws.Close() }
-func (c *wsConn) LocalAddr() net.Addr             { return dummyAddr(c.ws.LocalAddr().String()) }
-func (c *wsConn) RemoteAddr() net.Addr            { return dummyAddr(c.ws.RemoteAddr().String()) }
-func (c *wsConn) SetDeadline(t time.Time) error   { c.ws.SetReadDeadline(t); return c.ws.SetWriteDeadline(t) }
+func (c *wsConn) Close() error         { return c.ws.Close() }
+func (c *wsConn) LocalAddr() net.Addr  { return dummyAddr(c.ws.LocalAddr().String()) }
+func (c *wsConn) RemoteAddr() net.Addr { return dummyAddr(c.ws.RemoteAddr().String()) }
+func (c *wsConn) SetDeadline(t time.Time) error {
+	c.ws.SetReadDeadline(t)
+	return c.ws.SetWriteDeadline(t)
+}
 func (c *wsConn) SetReadDeadline(t time.Time) error  { return c.ws.SetReadDeadline(t) }
 func (c *wsConn) SetWriteDeadline(t time.Time) error { return c.ws.SetWriteDeadline(t) }
 
