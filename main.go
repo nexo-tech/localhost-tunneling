@@ -18,8 +18,6 @@ import (
 )
 
 func init() {
-	rand.Seed(time.Now().UnixNano())
-	// Structured JSON logging & debug level
 	logrus.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp:   true,
 		TimestampFormat: time.RFC3339,
@@ -132,7 +130,6 @@ func runServer(listenPort int, baseDomain string) {
 		mu.Unlock()
 		logrus.WithFields(logrus.Fields{"id": id, "base_domain": baseDomain}).Info("Client registered")
 
-		// Cleanup
 		go func() {
 			<-sess.CloseChan()
 			mu.Lock()
@@ -145,8 +142,13 @@ func runServer(listenPort int, baseDomain string) {
 	// Proxy HTTP based on subdomain
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
-		id := strings.TrimSuffix(host, "."+baseDomain)
-		logrus.WithFields(logrus.Fields{"host": host, "tunnel_id": id, "remote_addr": r.RemoteAddr}).Info("Incoming HTTP request")
+		// strip port if present
+		hostName := host
+		if strings.Contains(hostName, ":") {
+			hostName, _, _ = net.SplitHostPort(hostName)
+		}
+		id := strings.TrimSuffix(hostName, "."+baseDomain)
+		logrus.WithFields(logrus.Fields{"host": hostName, "tunnel_id": id, "remote_addr": r.RemoteAddr}).Info("Incoming HTTP request")
 
 		mu.RLock()
 		sess := sessions[id]
@@ -178,7 +180,7 @@ func runServer(listenPort int, baseDomain string) {
 			return
 		}
 
-		// Send raw HTTP over the stream
+		// Forward raw HTTP request over stream
 		if err := r.Write(stream); err != nil {
 			netConn.Close()
 			stream.Close()
@@ -186,7 +188,7 @@ func runServer(listenPort int, baseDomain string) {
 			return
 		}
 
-		// Bidirectional copy
+		// Relay response
 		go func() {
 			io.Copy(netConn, stream)
 			netConn.Close()
@@ -243,7 +245,7 @@ func handleStream(stream net.Conn, localPort int) {
 	defer stream.Close()
 	logrus.WithField("local_port", localPort).Debug("Handling new stream")
 
-	local, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
+	local, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", localPort))
 	if err != nil {
 		logrus.WithError(err).Error("Failed to connect to local service")
 		return
