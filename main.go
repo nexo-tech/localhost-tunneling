@@ -20,6 +20,10 @@ import (
 func init() {
 	rand.Seed(time.Now().UnixNano())
 	// Structured JSON logging & debug level
+	logrus.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: time.RFC3339,
+	})
 	logrus.SetFormatter(&logrus.JSONFormatter{})
 	logrus.SetLevel(logrus.DebugLevel)
 }
