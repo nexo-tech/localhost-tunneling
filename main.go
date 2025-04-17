@@ -24,7 +24,6 @@ func init() {
 		FullTimestamp:   true,
 		TimestampFormat: time.RFC3339,
 	})
-	logrus.SetFormatter(&logrus.JSONFormatter{})
 	logrus.SetLevel(logrus.DebugLevel)
 }
 
